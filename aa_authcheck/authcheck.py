@@ -63,28 +63,28 @@ WHERE co.user_id = %s
 ORDER BY ec.corporation_ticker
 """
 
-# corputils_corpmember is the canonical AA corp-roster table (populated by
-# the corpstats ESI scan). Joining out from there means we catch corp members
-# who never authed at all (orphans), not just characters AA already knows
-# about via ownership rows.
+# Roster source: every EveCharacter currently affiliated with the target corp.
+# This catches authed characters whose ownership row has been removed
+# (degraded "orphan" detection) and authed characters without a corptools
+# audit row (no-audit). It cannot see characters who have never been
+# registered in AA at all — the README's Caveats section explains the
+# limitation and points at corputils as a richer alternative.
 _CORP_ROSTER_SQL = """
 SELECT
-    cm.character_id        AS member_eve_id,
-    cm.character_name      AS character_name,
+    ec.character_id        AS member_eve_id,
+    ec.character_name      AS character_name,
     co.user_id             AS auth_user_id,
     au.username            AS auth_user,
     ca.id                  AS audit_id,
     ca.last_update_skills  AS last_update_skills,
     ca.last_update_assets  AS last_update_assets,
     ca.last_update_wallet  AS last_update_wallet
-FROM corputils_corpmember cm
-JOIN corputils_corpstats  cs ON cs.id = cm.corpstats_id
-LEFT JOIN eveonline_evecharacter            ec ON ec.character_id  = cm.character_id
-LEFT JOIN authentication_characterownership co ON co.character_id  = ec.id
-LEFT JOIN auth_user                         au ON au.id            = co.user_id
-LEFT JOIN corptools_characteraudit          ca ON ca.character_id  = ec.id
-WHERE cs.corp_id = %s
-ORDER BY cm.character_name
+FROM eveonline_evecharacter ec
+LEFT JOIN authentication_characterownership co ON co.character_id = ec.id
+LEFT JOIN auth_user                         au ON au.id           = co.user_id
+LEFT JOIN corptools_characteraudit          ca ON ca.character_id = ec.id
+WHERE ec.corporation_id = %s
+ORDER BY ec.character_name
 """
 
 
@@ -99,8 +99,8 @@ def _director_corps(auth_user_id: int):
     return _rows(_DIRECTOR_CORPS_SQL, [auth_user_id])
 
 
-def _corp_roster(corp_pk: int):
-    return _rows(_CORP_ROSTER_SQL, [corp_pk])
+def _corp_roster(corporation_id: int):
+    return _rows(_CORP_ROSTER_SQL, [corporation_id])
 
 
 def _resolve_auth_user(discord_id: int):
@@ -238,23 +238,14 @@ def _build_report(corps):
     """
     blocks = []
     for corp in corps:
-        try:
-            corp_pk = EveCorporationInfo.objects.get(
-                corporation_id=corp["corporation_id"]
-            ).pk
-        except EveCorporationInfo.DoesNotExist:
-            blocks.append(
-                f"__**{corp['corporation_ticker']}**__\n"
-                f"⚠️ Not registered in AA EveCorporationInfo — skipping."
-            )
-            continue
-        roster = _corp_roster(corp_pk)
+        roster = _corp_roster(corp["corporation_id"])
         if not roster:
             blocks.append(
                 f"__**{corp['corporation_ticker']}** "
                 f"({corp['corporation_name']})__\n"
-                f"⚠️ No corputils roster on file. Register a corpstats "
-                "token for this corp to enable the report."
+                f"⚠️ No AA-registered characters found in this corp. "
+                "Members who have never authed at all can't be detected — "
+                "see the README's Caveats section."
             )
             continue
         orphans, no_audit, stale = _bucket(roster)

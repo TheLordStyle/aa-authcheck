@@ -11,10 +11,8 @@ cog that reports, per corporation, which members are **orphans**
 which have **stale audit data** (last update older than a configurable
 threshold).
 
-Built on top of [aadiscordbot](https://github.com/pvyParts/allianceauth-discordbot),
-[allianceauth-corptools](https://github.com/Solar-Helix-Independent-Transport/allianceauth-corp-tools)
-and Alliance Auth's built-in [corputils](https://allianceauth.readthedocs.io/en/latest/features/apps/corputils.html)
-corp-roster app.
+Built on top of [aadiscordbot](https://github.com/pvyParts/allianceauth-discordbot)
+and [allianceauth-corptools](https://github.com/Solar-Helix-Independent-Transport/allianceauth-corp-tools).
 
 ## What it does
 
@@ -52,16 +50,16 @@ Outside both allow-lists the command silently refuses (slash: ephemeral
 
 | Component | Version |
 |---|---|
-| Alliance Auth | ≥ 5.0 (uses the bundled `corputils` app) |
+| Alliance Auth | ≥ 5.0 |
 | [allianceauth-discordbot](https://github.com/pvyParts/allianceauth-discordbot) | recent |
 | [allianceauth-corptools](https://github.com/Solar-Helix-Independent-Transport/allianceauth-corp-tools) | ≥ 2.x |
 | Database | MySQL / MariaDB |
 
-For each corp you want to report on, the AA built-in **Corp Stats**
-module needs an active token registered (so the roster table is
-populated). Corptools must have at least one character per director's
-account scanned with `esi-characters.read_corporation_roles.v1` for the
-director check to find them.
+Corptools must have at least one character per director's account
+scanned with `esi-characters.read_corporation_roles.v1` so the
+director check can find them. No corp-level ESI tokens are required —
+the per-corp roster is derived from each character's public ESI data
+(see [Caveats](#caveats) for the trade-off).
 
 ## Install
 
@@ -70,7 +68,7 @@ director check to find them.
 Add to your AA `requirements.txt`:
 
 ```text
-git+https://github.com/TheLordStyle/aa-authcheck.git@v0.1.0
+git+https://github.com/TheLordStyle/aa-authcheck.git@v0.1.1
 ```
 
 Then in `local.py`:
@@ -161,21 +159,16 @@ so there's a public record of off-channel lookups.
 
 ## How it works
 
-Per-corp report — one raw SQL query against:
+Per-corp report — one raw SQL query anchored on
+`eveonline_evecharacter` filtered by `corporation_id`, with left joins to:
 
-- `corputils_corpmember` joined to `corputils_corpstats` — the
-  canonical AA corp roster, populated by the corpstats ESI scan.
-- `eveonline_evecharacter` (left join) — to bridge from the roster's
-  EVE `character_id` to AA's internal character pk.
-- `authentication_characterownership` (left join) — `NULL` →
-  classified as an **orphan**.
-- `auth_user` (left join) — display the auth account username when one
-  exists.
-- `corptools_characteraudit` (left join) — `NULL` → classified as
-  **no audit**; otherwise its `last_update_skills`,
-  `last_update_assets` and `last_update_wallet` timestamps are
-  compared against `AUTHCHECK_STALE_DAYS` to classify as **stale** or
-  **ok**.
+- `authentication_characterownership` — `NULL` → classified as an
+  **orphan** (AA has the character but no user owns it).
+- `auth_user` — display the auth account username when one exists.
+- `corptools_characteraudit` — `NULL` → classified as **no audit**;
+  otherwise its `last_update_skills`, `last_update_assets` and
+  `last_update_wallet` timestamps are compared against
+  `AUTHCHECK_STALE_DAYS` to classify as **stale** or **ok**.
 
 Director detection — one raw SQL query joining
 `authentication_characterownership` → `eveonline_evecharacter` →
@@ -185,18 +178,23 @@ character with `director = 1`.
 
 ## Caveats
 
-- **Roster freshness.** The roster comes from `corputils_corpmember`,
-  which is only as fresh as the last corpstats update — typically once
-  per ESI cache cycle. A character who joined or left in the last hour
-  may not appear yet.
+- **Orphan detection is partial.** The roster is derived from
+  `eveonline_evecharacter`, so the cog can only see characters that
+  have been registered in AA at some point — not the full corp
+  membership. Characters who are in the corp in EVE but have *never*
+  authed anywhere can't be detected. To get full coverage you'd need
+  to anchor the roster on Alliance Auth's bundled **Corp Stats** app
+  (which requires a per-corp ESI token); this cog doesn't read from
+  it today, but a future version may add it as an optional richer
+  source.
+- **Corp freshness.** `EveCharacter.corporation_id` is updated when
+  AA refreshes a character's public ESI data (runs periodically via
+  `run_model_update`). A character who switched corps in the last
+  hour may still be reported under their old corp.
 - **Director freshness.** The director flag comes from corptools'
   roles scan, which uses ESI's `read_corporation_roles` cache. New
   directors won't be recognised until corptools' next scheduled scan
   for that character.
-- **No corpstats token, no report.** If a corp isn't covered by a
-  corpstats token, the per-corp section says so and lists no members
-  rather than guessing from `eveonline_evecharacter` (which would miss
-  unauthed people entirely — defeating the point of the orphan check).
 
 ## Contributing
 
