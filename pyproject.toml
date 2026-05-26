@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aa-authcheck"
+version = "0.1.0"
+description = "Alliance Auth Discord cog reporting on un-authed, un-audited and stale-audit characters per corp"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "LordStyle" },
+]
+keywords = ["allianceauth", "eve-online", "discord", "aadiscordbot", "corptools"]
+classifiers = [
+    "Environment :: Plugins",
+    "Framework :: Django",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment",
+]
+
+# Intentionally no `dependencies = [...]` here — Alliance Auth, aadiscordbot
+# and allianceauth-corptools must already be installed in the host environment.
+# Declaring them would risk pip resolving conflicting versions on install.
+
+[project.urls]
+Repository = "https://github.com/TheLordStyle/aa-authcheck"
+Issues = "https://github.com/TheLordStyle/aa-authcheck/issues"
+
+[tool.setuptools.packages.find]
+include = ["aa_authcheck*"]
