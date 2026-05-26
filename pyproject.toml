@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aa-authcheck"
-version = "0.1.1"
+version = "0.1.2"
 description = "Alliance Auth Discord cog reporting on un-authed, un-audited and stale-audit characters per corp"
 readme = "README.md"
 requires-python = ">=3.10"

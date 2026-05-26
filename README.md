@@ -68,7 +68,7 @@ the per-corp roster is derived from each character's public ESI data
 Add to your AA `requirements.txt`:
 
 ```text
-git+https://github.com/TheLordStyle/aa-authcheck.git@v0.1.1
+git+https://github.com/TheLordStyle/aa-authcheck.git@v0.1.2
 ```
 
 Then in `local.py`:

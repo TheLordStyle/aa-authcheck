@@ -1,6 +1,6 @@
 """AuthCheck: report orphan / un-audited / stale-audit characters per corp."""
 import logging
-from datetime import timedelta
+from datetime import timedelta, timezone as dt_timezone
 
 import discord
 from aadiscordbot.app_settings import get_all_servers
@@ -126,6 +126,14 @@ _AUDIT_FRESHNESS_FIELDS = (
 )
 
 
+def _aware(dt):
+    # Raw cursor.fetchall() returns naive datetimes from MySQL even with
+    # USE_TZ=True; treat those as UTC so we can compare against an aware cutoff.
+    if dt is None or timezone.is_aware(dt):
+        return dt
+    return dt.replace(tzinfo=dt_timezone.utc)
+
+
 def _classify(row, cutoff):
     if row["auth_user_id"] is None:
         return "orphan", []
@@ -133,7 +141,7 @@ def _classify(row, cutoff):
         return "no_audit", []
     stale = [
         f for f in _AUDIT_FRESHNESS_FIELDS
-        if row[f] is None or row[f] < cutoff
+        if row[f] is None or _aware(row[f]) < cutoff
     ]
     return ("stale" if stale else "ok"), stale
 
@@ -176,31 +184,70 @@ def _fmt_stale(r):
     )
 
 
+# Single embed description can hold 4096 chars; keep blocks under this so
+# _build_embeds never produces an oversize page that Discord will 400 on.
+_MAX_BLOCK = 3500
+
+
+def _chunk_section(section_header, lines):
+    """Split one bucket's lines into ≤_MAX_BLOCK-char chunks.
+
+    Each chunk carries its own header — the first uses `section_header`
+    verbatim, follow-ups append ` (cont.)`.
+    """
+    chunks, current, size = [], [section_header], len(section_header)
+    for line in lines:
+        addition = len(line) + 1  # newline
+        if size + addition > _MAX_BLOCK and len(current) > 1:
+            chunks.append("\n".join(current))
+            cont = f"{section_header} (cont.)"
+            current, size = [cont, line], len(cont) + addition
+        else:
+            current.append(line)
+            size += addition
+    chunks.append("\n".join(current))
+    return chunks
+
+
 def _corp_block(corp_ticker, corp_name, orphans, no_audit, stale, total):
+    """Return one or more text blocks for this corp's report.
+
+    Splitting per-bucket (and within a bucket when needed) keeps each
+    returned string under Discord's embed-description cap.
+    """
     stale_days = getattr(settings, "AUTHCHECK_STALE_DAYS", 7)
-    parts = [f"__**{corp_ticker}** ({corp_name}) — {total} members__"]
+    header = f"__**{corp_ticker}** ({corp_name}) — {total} members__"
+
     if not orphans and not no_audit and not stale:
-        parts.append(f"✅ All members are authed and up to date.")
-        return "\n".join(parts)
+        return [f"{header}\n✅ All members are authed and up to date."]
+
+    sections = []
     if orphans:
-        parts.append(
+        sections.extend(_chunk_section(
             f"**🟥 Orphans ({len(orphans)})** — in corp roster, "
-            "no auth ownership\n"
-            + "\n".join(_fmt_orphan(r) for r in orphans)
-        )
+            "no auth ownership",
+            [_fmt_orphan(r) for r in orphans],
+        ))
     if no_audit:
-        parts.append(
+        sections.extend(_chunk_section(
             f"**🟧 No corptools audit ({len(no_audit)})** — authed but "
-            "never registered the audit token\n"
-            + "\n".join(_fmt_no_audit(r) for r in no_audit)
-        )
+            "never registered the audit token",
+            [_fmt_no_audit(r) for r in no_audit],
+        ))
     if stale:
-        parts.append(
+        sections.extend(_chunk_section(
             f"**🟨 Stale audit ({len(stale)})** — last update older than "
-            f"{stale_days} days\n"
-            + "\n".join(_fmt_stale(r) for r in stale)
-        )
-    return "\n\n".join(parts)
+            f"{stale_days} days",
+            [_fmt_stale(r) for r in stale],
+        ))
+
+    # Prepend the corp header to the first section block only.
+    first = f"{header}\n{sections[0]}"
+    if len(first) <= _MAX_BLOCK:
+        return [first] + sections[1:]
+    # Pathological: even the first section is at the cap. Keep the header
+    # on a standalone block so we never exceed _MAX_BLOCK.
+    return [header] + sections
 
 
 def _build_embeds(text_blocks, title, empty_message="Nothing to report."):
@@ -249,7 +296,7 @@ def _build_report(corps):
             )
             continue
         orphans, no_audit, stale = _bucket(roster)
-        blocks.append(_corp_block(
+        blocks.extend(_corp_block(
             corp["corporation_ticker"],
             corp["corporation_name"],
             orphans, no_audit, stale,
@@ -320,6 +367,26 @@ class AuthCheck(commands.Cog):
         default=False,
     )
     async def slash_authcheck(self, ctx, corp: str = None, dm: bool = False):
+        try:
+            await self._slash_impl(ctx, corp, dm)
+        except Exception as e:
+            # aadiscordbot's generic error handler swallows the traceback
+            # and shows the user "Something Went Wrong" — log it here so
+            # the discordbot log captures the real failure.
+            logger.exception("authcheck slash command failed")
+            msg = (
+                f"⚠️ AuthCheck hit `{type(e).__name__}`. Ask an admin to "
+                "check the discordbot log for the traceback."
+            )
+            try:
+                if ctx.response.is_done():
+                    await ctx.followup.send(msg, ephemeral=True)
+                else:
+                    await ctx.respond(msg, ephemeral=True)
+            except Exception:
+                logger.exception("authcheck error reply also failed")
+
+    async def _slash_impl(self, ctx, corp, dm):
         tier = _channel_tier(ctx.channel.id)
         if tier is None:
             return await ctx.respond(
