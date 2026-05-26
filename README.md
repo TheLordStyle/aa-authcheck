@@ -45,6 +45,10 @@ Outside both allow-lists the command silently refuses (slash: ephemeral
 >
 > **🟨 Stale audit (1)** — last update older than 7 days
 > • **Frank Stale** — authed as `frank`, stale: skills, assets
+>
+> **🟩 OK (118)** — authed and audit fresh
+> • **Grace Onpoint** — authed as `grace`
+> • _(... 117 more ...)_
 
 ## Requirements
 
@@ -68,7 +72,7 @@ the per-corp roster is derived from each character's public ESI data
 Add to your AA `requirements.txt`:
 
 ```text
-git+https://github.com/TheLordStyle/aa-authcheck.git@v0.1.2
+git+https://github.com/TheLordStyle/aa-authcheck.git@v0.1.3
 ```
 
 Then in `local.py`:

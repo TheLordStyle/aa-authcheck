@@ -150,7 +150,7 @@ def _bucket(rows):
     cutoff = timezone.now() - timedelta(
         days=getattr(settings, "AUTHCHECK_STALE_DAYS", 7)
     )
-    orphans, no_audit, stale = [], [], []
+    orphans, no_audit, stale, ok = [], [], [], []
     for r in rows:
         kind, stale_fields = _classify(r, cutoff)
         if kind == "orphan":
@@ -160,7 +160,9 @@ def _bucket(rows):
         elif kind == "stale":
             r["_stale_fields"] = stale_fields
             stale.append(r)
-    return orphans, no_audit, stale
+        else:
+            ok.append(r)
+    return orphans, no_audit, stale, ok
 
 
 def _fmt_orphan(r):
@@ -182,6 +184,10 @@ def _fmt_stale(r):
         f"• **{r['character_name']}** — authed as `{r['auth_user']}`, "
         f"stale: {fields}"
     )
+
+
+def _fmt_ok(r):
+    return f"• **{r['character_name']}** — authed as `{r['auth_user']}`"
 
 
 # Single embed description can hold 4096 chars; keep blocks under this so
@@ -209,7 +215,7 @@ def _chunk_section(section_header, lines):
     return chunks
 
 
-def _corp_block(corp_ticker, corp_name, orphans, no_audit, stale, total):
+def _corp_block(corp_ticker, corp_name, orphans, no_audit, stale, ok, total):
     """Return one or more text blocks for this corp's report.
 
     Splitting per-bucket (and within a bucket when needed) keeps each
@@ -217,9 +223,6 @@ def _corp_block(corp_ticker, corp_name, orphans, no_audit, stale, total):
     """
     stale_days = getattr(settings, "AUTHCHECK_STALE_DAYS", 7)
     header = f"__**{corp_ticker}** ({corp_name}) — {total} members__"
-
-    if not orphans and not no_audit and not stale:
-        return [f"{header}\n✅ All members are authed and up to date."]
 
     sections = []
     if orphans:
@@ -240,6 +243,16 @@ def _corp_block(corp_ticker, corp_name, orphans, no_audit, stale, total):
             f"{stale_days} days",
             [_fmt_stale(r) for r in stale],
         ))
+    if ok:
+        sections.extend(_chunk_section(
+            f"**🟩 OK ({len(ok)})** — authed and audit fresh",
+            [_fmt_ok(r) for r in ok],
+        ))
+
+    if not sections:
+        # Empty roster (already messaged upstream in _build_report) — keep
+        # this branch for safety.
+        return [f"{header}\n_No members._"]
 
     # Prepend the corp header to the first section block only.
     first = f"{header}\n{sections[0]}"
@@ -295,11 +308,11 @@ def _build_report(corps):
                 "see the README's Caveats section."
             )
             continue
-        orphans, no_audit, stale = _bucket(roster)
+        orphans, no_audit, stale, ok = _bucket(roster)
         blocks.extend(_corp_block(
             corp["corporation_ticker"],
             corp["corporation_name"],
-            orphans, no_audit, stale,
+            orphans, no_audit, stale, ok,
             len(roster),
         ))
 
