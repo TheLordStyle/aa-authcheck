@@ -164,7 +164,7 @@ production state always returns to whatever's pinned in
 | `AUTHCHECK_STALE_DAYS` | `7` | `/authcheck`: day threshold beyond which a character's `last_update_*` timestamp counts as stale. |
 | `AUTHCHECK_MEMBER_STATES` | `["Member"]` | `/authcorpcheck`: AA State names whose corporations form the super-channel default scope. |
 | `AUTHCHECK_CORP_STALE_HOURS` | `6` | `/authcorpcheck`: hour threshold beyond which a corp-audit timestamp counts as stale (corptools updates corps hourly by default). |
-| `AUTHCHECK_CORP_AUDIT_FIELDS` | `["wallet", "structures", "assets"]` | `/authcorpcheck`: which corp-audit `last_update_<field>` timestamps to check. Valid names: `pub_data`, `assets`, `structures`, `moons`, `observers`, `wallet`, `contracts`, `known_login`. |
+| `AUTHCHECK_CORP_AUDIT_FIELDS` | `["wallet", "structures", "assets"]` | `/authcorpcheck`: which corp-audit `last_update_<field>` timestamps to check. Valid names: `pub_data`, `assets`, `structures`, `moons`, `observers`, `wallet`, `contracts`, `known_login`. Set to `[]` to check presence only (no staleness). Unknown names are ignored with a log warning; if none are valid, the default list is used. |
 
 Structure-owner sync freshness reuses the structures app's own grace
 settings when present: `STRUCTURES_STRUCTURE_SYNC_GRACE_MINUTES`

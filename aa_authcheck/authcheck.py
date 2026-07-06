@@ -481,18 +481,28 @@ _DEFAULT_CORP_AUDIT_FIELDS = ["wallet", "structures", "assets"]
 
 
 def _corp_audit_fields():
-    """Validated AUTHCHECK_CORP_AUDIT_FIELDS short names."""
-    configured = getattr(
-        settings, "AUTHCHECK_CORP_AUDIT_FIELDS", _DEFAULT_CORP_AUDIT_FIELDS
-    )
+    """Validated AUTHCHECK_CORP_AUDIT_FIELDS short names.
+
+    An explicitly empty list means "check presence only, no staleness
+    fields". Unknown names are dropped with a warning; if the setting
+    contained only unknown names, fall back to the defaults rather than
+    silently checking nothing.
+    """
+    configured = getattr(settings, "AUTHCHECK_CORP_AUDIT_FIELDS", None)
+    if configured is None:
+        return list(_DEFAULT_CORP_AUDIT_FIELDS)
     valid = [f for f in configured if f in _CORP_AUDIT_FIELD_NAMES]
     unknown = [f for f in configured if f not in _CORP_AUDIT_FIELD_NAMES]
     if unknown:
         logger.warning(
             "AUTHCHECK_CORP_AUDIT_FIELDS contains unknown fields %s "
-            "(valid: %s)", unknown, list(_CORP_AUDIT_FIELD_NAMES),
+            "(valid: %s)%s",
+            unknown, list(_CORP_AUDIT_FIELD_NAMES),
+            "" if valid else " — falling back to the default field list",
         )
-    return valid or _DEFAULT_CORP_AUDIT_FIELDS
+        if not valid:
+            return list(_DEFAULT_CORP_AUDIT_FIELDS)
+    return valid
 
 
 def _age_str(dt, now):
@@ -504,13 +514,13 @@ def _age_str(dt, now):
     return f"{int(hours // 24)}d ago"
 
 
-def _corptools_line(audit_row, cutoff, now):
+def _corptools_line(audit_row, cutoff, now, fields):
     """(is_ok, text) for the corptools corp-audit half of a corp block."""
     if audit_row is None:
         return False, "🟥 Corptools: corp not loaded into corp audit"
     stale = [
         f"{name} ({_age_str(audit_row[f'last_update_{name}'], now)})"
-        for name in _corp_audit_fields()
+        for name in fields
         if audit_row[f"last_update_{name}"] is None
         or _aware(audit_row[f"last_update_{name}"]) < cutoff
     ]
@@ -556,7 +566,7 @@ def _structures_line(owner_row, now):
 
 
 def _corp_status_block(target, audit_row, owner_row, structures_installed,
-                       cutoff, now):
+                       cutoff, now, fields):
     """(has_issue, block) for one corp in the authcorpcheck report."""
     header = f"__**{target['ticker']}** ({target['name']})__"
     if target["pk"] is None:
@@ -565,7 +575,7 @@ def _corp_status_block(target, audit_row, owner_row, structures_installed,
             "(no EveCorporationInfo) — audit checks impossible."
         )
     lines = []
-    ct_ok, ct_text = _corptools_line(audit_row, cutoff, now)
+    ct_ok, ct_text = _corptools_line(audit_row, cutoff, now, fields)
     lines.append(ct_text)
     st_ok = True
     if structures_installed:
@@ -580,6 +590,7 @@ def _build_corp_report(targets, scope_label):
     cutoff = now - timedelta(
         hours=getattr(settings, "AUTHCHECK_CORP_STALE_HOURS", 6)
     )
+    fields = _corp_audit_fields()
     pks = [t["pk"] for t in targets if t["pk"] is not None]
     audits = {r["corp_pk"]: r for r in _rows_in(_CORP_AUDIT_SQL, pks)}
     structures_installed = apps.is_installed("structures")
@@ -592,7 +603,7 @@ def _build_corp_report(targets, scope_label):
     for t in sorted(targets, key=lambda t: t["ticker"]):
         has_issue, block = _corp_status_block(
             t, audits.get(t["pk"]), owners.get(t["pk"]),
-            structures_installed, cutoff, now,
+            structures_installed, cutoff, now, fields,
         )
         if has_issue:
             issue_blocks.append(block)
@@ -600,7 +611,8 @@ def _build_corp_report(targets, scope_label):
             ok_tickers.append(t["ticker"])
 
     header = (
-        f"**{len(targets)} corps checked — {len(issue_blocks)} with issues**"
+        f"**{len(targets)} corp{'s' if len(targets) != 1 else ''} checked "
+        f"— {len(issue_blocks)} with issues**"
     )
     if not structures_installed:
         header += "\n⚠️ aa-structures is not installed — structure owner checks skipped."
@@ -741,8 +753,11 @@ class AuthCheck(commands.Cog):
                 )
             dm = True
 
-        await ctx.defer(ephemeral=dm)
-
+        # Resolve the invoker and scope BEFORE deferring: once a
+        # non-ephemeral defer is sent, Discord ignores ephemeral=True on
+        # the follow-ups, so these error replies would post publicly in
+        # super channels. The lookups are cheap single queries — the
+        # 3-second interaction deadline is not at risk.
         auth_user = _resolve_auth_user(ctx.user.id)
         if auth_user is None:
             return await ctx.respond(
@@ -771,6 +786,7 @@ class AuthCheck(commands.Cog):
                 )
             scope_label = "your director corps"
 
+        await ctx.defer(ephemeral=dm)
         embeds = _build_report(corps)
 
         if dm:
@@ -851,8 +867,8 @@ class AuthCheck(commands.Cog):
                 )
             dm = True
 
-        await ctx.defer(ephemeral=dm)
-
+        # Same defer-last rationale as _slash_impl: keep the error
+        # replies genuinely ephemeral in super channels.
         auth_user = _resolve_auth_user(ctx.user.id)
         if auth_user is None:
             return await ctx.respond(
@@ -892,6 +908,7 @@ class AuthCheck(commands.Cog):
                 )
             scope_label = f"{'/'.join(state_names)} state corps"
 
+        await ctx.defer(ephemeral=dm)
         embeds = _build_corp_report(targets, scope_label)
 
         if dm:
