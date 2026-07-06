@@ -1,4 +1,10 @@
-"""AuthCheck: report orphan / un-audited / stale-audit characters per corp."""
+"""AuthCheck cog.
+
+Two commands:
+  /authcheck     — per-character auth & audit status for a corp's roster.
+  /authcorpcheck — per-corporation audit health (corptools corp audit +
+                   aa-structures owner status).
+"""
 import logging
 from datetime import timedelta, timezone as dt_timezone
 
@@ -8,11 +14,13 @@ from discord import option
 from discord.embeds import Embed
 from discord.ext import commands
 
+from django.apps import apps
 from django.conf import settings
 from django.db import connection
 from django.db.models import Q
 from django.utils import timezone
 
+from allianceauth.authentication.models import State
 from allianceauth.eveonline.models import EveCorporationInfo
 from allianceauth.services.modules.discord.models import DiscordUser
 
@@ -115,6 +123,135 @@ def _resolve_corp(ticker_or_name: str):
     return EveCorporationInfo.objects.filter(
         Q(corporation_ticker__iexact=s) | Q(corporation_name__iexact=s)
     ).first()
+
+
+# ---- Corp-level data access (authcorpcheck) ---------------------------------
+
+# In both tables below, the column named `corporation_id` is a FK to
+# eveonline_evecorporationinfo.id (the Django pk) — NOT the EVE corp id:
+#   corptools_corporationaudit.corporation_id -> eveonline_evecorporationinfo.id
+#   structures_owner.corporation_id           -> eveonline_evecorporationinfo.id
+#                                                (also that table's PRIMARY KEY)
+
+# All corptools 2.x corp-audit timestamp columns. The configurable
+# AUTHCHECK_CORP_AUDIT_FIELDS subset is applied in Python so the SQL
+# stays static (no dynamic column interpolation).
+_CORP_AUDIT_FIELD_NAMES = (
+    "pub_data",
+    "assets",
+    "structures",
+    "moons",
+    "observers",
+    "wallet",
+    "contracts",
+    "known_login",
+)
+
+_CORP_AUDIT_SQL = """
+SELECT
+    ca.corporation_id          AS corp_pk,
+    ca.last_update_pub_data    AS last_update_pub_data,
+    ca.last_update_assets      AS last_update_assets,
+    ca.last_update_structures  AS last_update_structures,
+    ca.last_update_moons       AS last_update_moons,
+    ca.last_update_observers   AS last_update_observers,
+    ca.last_update_wallet      AS last_update_wallet,
+    ca.last_update_contracts   AS last_update_contracts,
+    ca.last_update_known_login AS last_update_known_login
+FROM corptools_corporationaudit ca
+WHERE ca.corporation_id IN ({placeholders})
+"""
+
+# Full GROUP BY column list on purpose — MariaDB's strict modes don't
+# infer functional dependency on the PK the way MySQL 5.7+ does.
+_STRUCTURES_OWNER_SQL = """
+SELECT
+    o.corporation_id                AS corp_pk,
+    o.is_active                     AS is_active,
+    o.structures_last_update_at     AS structures_last_update_at,
+    o.notifications_last_update_at  AS notifications_last_update_at,
+    o.forwarding_last_update_at     AS forwarding_last_update_at,
+    o.assets_last_update_at         AS assets_last_update_at,
+    COUNT(oc.id)                    AS char_total,
+    COALESCE(SUM(oc.is_enabled), 0) AS char_enabled
+FROM structures_owner o
+LEFT JOIN structures_ownercharacter oc ON oc.owner_id = o.corporation_id
+WHERE o.corporation_id IN ({placeholders})
+GROUP BY
+    o.corporation_id,
+    o.is_active,
+    o.structures_last_update_at,
+    o.notifications_last_update_at,
+    o.forwarding_last_update_at,
+    o.assets_last_update_at
+"""
+
+
+def _rows_in(sql_template, pks):
+    """Run an IN-clause query via _rows; [] for an empty pk list.
+
+    The placeholder string is derived from len(pks) only — never from
+    user input — so the .format() is injection-safe.
+    """
+    if not pks:
+        return []
+    placeholders = ", ".join(["%s"] * len(pks))
+    return _rows(sql_template.format(placeholders=placeholders), list(pks))
+
+
+def _target_from_corp(corp):
+    return {
+        "pk":     corp.pk,
+        "eve_id": corp.corporation_id,
+        "name":   corp.corporation_name,
+        "ticker": corp.corporation_ticker,
+    }
+
+
+def _corp_targets_from_directors(auth_user_id: int):
+    """Director corps as report targets, mapped to EveCorporationInfo pks.
+
+    _director_corps() returns the EVE corporation_id (from EveCharacter
+    columns); the corp-audit and structures tables key on the
+    EveCorporationInfo pk instead. Match via str() on both sides — the
+    model column is a CharField while the character column may be int.
+    pk None => corp has no EveCorporationInfo row at all (reported as a
+    finding downstream).
+    """
+    dirs = _director_corps(auth_user_id)
+    pk_by_eve = {
+        str(c.corporation_id): c.pk
+        for c in EveCorporationInfo.objects.filter(
+            corporation_id__in=[d["corporation_id"] for d in dirs]
+        )
+    }
+    return [{
+        "pk":     pk_by_eve.get(str(d["corporation_id"])),
+        "eve_id": d["corporation_id"],
+        "name":   d["corporation_name"],
+        "ticker": d["corporation_ticker"],
+    } for d in dirs]
+
+
+def _member_state_targets():
+    """All EveCorporationInfo rows in the configured member states.
+
+    Union of each state's explicit member_corporations and every corp
+    whose alliance is in the state's member_alliances (AA auto-creates
+    and maintains those rows via the hourly update_alliance task).
+    """
+    names = getattr(settings, "AUTHCHECK_MEMBER_STATES", ["Member"])
+    corp_pks, alliance_pks = set(), set()
+    for st in State.objects.filter(name__in=names):
+        corp_pks.update(st.member_corporations.values_list("pk", flat=True))
+        alliance_pks.update(st.member_alliances.values_list("pk", flat=True))
+    qs = (
+        EveCorporationInfo.objects
+        .filter(Q(pk__in=corp_pks) | Q(alliance_id__in=alliance_pks))
+        .distinct()
+        .order_by("corporation_ticker")
+    )
+    return [_target_from_corp(c) for c in qs]
 
 
 # ---- Classification & formatting -------------------------------------------
@@ -323,6 +460,174 @@ def _build_report(corps):
     return _build_embeds(blocks, title)
 
 
+# ---- Corp-level classification & formatting (authcorpcheck) -----------------
+
+# aa-structures' own freshness rules: structures/assets share one grace
+# window, notifications/forwarding share another. Mirrors the app's
+# are_all_syncs_ok property (NULL timestamp = not fresh).
+_STRUCT_SYNC_FIELDS = (
+    # (column, label, settings key, default grace minutes)
+    ("structures_last_update_at",    "structures",
+     "STRUCTURES_STRUCTURE_SYNC_GRACE_MINUTES",    120),
+    ("assets_last_update_at",        "assets",
+     "STRUCTURES_STRUCTURE_SYNC_GRACE_MINUTES",    120),
+    ("notifications_last_update_at", "notifications",
+     "STRUCTURES_NOTIFICATION_SYNC_GRACE_MINUTES", 40),
+    ("forwarding_last_update_at",    "forwarding",
+     "STRUCTURES_NOTIFICATION_SYNC_GRACE_MINUTES", 40),
+)
+
+_DEFAULT_CORP_AUDIT_FIELDS = ["wallet", "structures", "assets"]
+
+
+def _corp_audit_fields():
+    """Validated AUTHCHECK_CORP_AUDIT_FIELDS short names.
+
+    An explicitly empty list means "check presence only, no staleness
+    fields". Unknown names are dropped with a warning; if the setting
+    contained only unknown names, fall back to the defaults rather than
+    silently checking nothing.
+    """
+    configured = getattr(settings, "AUTHCHECK_CORP_AUDIT_FIELDS", None)
+    if configured is None:
+        return list(_DEFAULT_CORP_AUDIT_FIELDS)
+    valid = [f for f in configured if f in _CORP_AUDIT_FIELD_NAMES]
+    unknown = [f for f in configured if f not in _CORP_AUDIT_FIELD_NAMES]
+    if unknown:
+        logger.warning(
+            "AUTHCHECK_CORP_AUDIT_FIELDS contains unknown fields %s "
+            "(valid: %s)%s",
+            unknown, list(_CORP_AUDIT_FIELD_NAMES),
+            "" if valid else " — falling back to the default field list",
+        )
+        if not valid:
+            return list(_DEFAULT_CORP_AUDIT_FIELDS)
+    return valid
+
+
+def _age_str(dt, now):
+    if dt is None:
+        return "never"
+    hours = (now - _aware(dt)).total_seconds() / 3600
+    if hours < 48:
+        return f"{hours:.1f}h ago"
+    return f"{int(hours // 24)}d ago"
+
+
+def _corptools_line(audit_row, cutoff, now, fields):
+    """(is_ok, text) for the corptools corp-audit half of a corp block."""
+    if audit_row is None:
+        return False, "🟥 Corptools: corp not loaded into corp audit"
+    stale = [
+        f"{name} ({_age_str(audit_row[f'last_update_{name}'], now)})"
+        for name in fields
+        if audit_row[f"last_update_{name}"] is None
+        or _aware(audit_row[f"last_update_{name}"]) < cutoff
+    ]
+    if stale:
+        return False, f"🟨 Corptools: stale: {', '.join(stale)}"
+    return True, "🟩 Corptools: audit fresh"
+
+
+def _structures_line(owner_row, now):
+    """(is_ok, text) for the aa-structures half of a corp block."""
+    if owner_row is None:
+        return False, "🟧 Structures: not registered as structure owner"
+
+    char_total = int(owner_row["char_total"] or 0)
+    char_enabled = int(owner_row["char_enabled"] or 0)
+    tokens = f"tokens {char_enabled}/{char_total} enabled"
+
+    if not owner_row["is_active"]:
+        return False, f"🟥 Structures: owner disabled (is_active=False); {tokens}"
+    if char_total == 0:
+        return False, "🟥 Structures: no owner characters registered (no sync tokens)"
+    if char_enabled == 0:
+        return False, (
+            f"🟥 Structures: all {char_total} owner characters disabled "
+            "(token failures)"
+        )
+
+    stale = [
+        f"{label} ({_age_str(owner_row[col], now)})"
+        for col, label, key, default in _STRUCT_SYNC_FIELDS
+        if owner_row[col] is None
+        or _aware(owner_row[col])
+        < now - timedelta(minutes=getattr(settings, key, default))
+    ]
+    notes = []
+    if stale:
+        notes.append(f"stale sync: {', '.join(stale)}")
+    if char_enabled < char_total:
+        notes.append(tokens)
+    if notes:
+        return False, f"🟨 Structures: {'; '.join(notes)}"
+    return True, f"🟩 Structures: active, syncs fresh, {tokens}"
+
+
+def _corp_status_block(target, audit_row, owner_row, structures_installed,
+                       cutoff, now, fields):
+    """(has_issue, block) for one corp in the authcorpcheck report."""
+    header = f"__**{target['ticker']}** ({target['name']})__"
+    if target["pk"] is None:
+        return True, (
+            f"{header}\n🟥 Not registered in Alliance Auth "
+            "(no EveCorporationInfo) — audit checks impossible."
+        )
+    lines = []
+    ct_ok, ct_text = _corptools_line(audit_row, cutoff, now, fields)
+    lines.append(ct_text)
+    st_ok = True
+    if structures_installed:
+        st_ok, st_text = _structures_line(owner_row, now)
+        lines.append(st_text)
+    return (not (ct_ok and st_ok)), header + "\n" + "\n".join(lines)
+
+
+def _build_corp_report(targets, scope_label):
+    """Build embed pages for the corp-level audit health report."""
+    now = timezone.now()
+    cutoff = now - timedelta(
+        hours=getattr(settings, "AUTHCHECK_CORP_STALE_HOURS", 6)
+    )
+    fields = _corp_audit_fields()
+    pks = [t["pk"] for t in targets if t["pk"] is not None]
+    audits = {r["corp_pk"]: r for r in _rows_in(_CORP_AUDIT_SQL, pks)}
+    structures_installed = apps.is_installed("structures")
+    owners = (
+        {r["corp_pk"]: r for r in _rows_in(_STRUCTURES_OWNER_SQL, pks)}
+        if structures_installed else {}
+    )
+
+    issue_blocks, ok_tickers = [], []
+    for t in sorted(targets, key=lambda t: t["ticker"]):
+        has_issue, block = _corp_status_block(
+            t, audits.get(t["pk"]), owners.get(t["pk"]),
+            structures_installed, cutoff, now, fields,
+        )
+        if has_issue:
+            issue_blocks.append(block)
+        else:
+            ok_tickers.append(t["ticker"])
+
+    header = (
+        f"**{len(targets)} corp{'s' if len(targets) != 1 else ''} checked "
+        f"— {len(issue_blocks)} with issues**"
+    )
+    if not structures_installed:
+        header += "\n⚠️ aa-structures is not installed — structure owner checks skipped."
+    blocks = [header] + issue_blocks
+    if ok_tickers:
+        ok_lines = [
+            ", ".join(ok_tickers[i:i + 10])
+            for i in range(0, len(ok_tickers), 10)
+        ]
+        blocks.extend(_chunk_section(
+            f"**🟩 All OK ({len(ok_tickers)})**", ok_lines,
+        ))
+    return _build_embeds(blocks, f"AuthCorpCheck report: {scope_label}")
+
+
 # ---- The cog ----------------------------------------------------------------
 
 class AuthCheck(commands.Cog):
@@ -353,6 +658,36 @@ class AuthCheck(commands.Cog):
                 "You're not a director on any registered character."
             )
         embeds = _build_report(corps)
+        try:
+            for e in embeds:
+                await ctx.author.send(embed=e)
+        except discord.Forbidden:
+            return await ctx.message.reply(
+                "I can't DM you — check **Server Settings → Privacy → "
+                "Allow direct messages from server members**."
+            )
+        await ctx.message.add_reaction(chr(0x1F44D))  # 👍
+
+    @commands.command(pass_context=True)
+    async def authcorpcheck(self, ctx):
+        """!authcorpcheck — DM corp-audit health for the invoker's director corps.
+
+        Super-channel features (specifying a corp, member-state scope,
+        channel reply, audit line) are slash-only by design.
+        """
+        if _channel_tier(ctx.message.channel.id) is None:
+            return await ctx.message.add_reaction(chr(0x1F44E))  # 👎
+        auth_user = _resolve_auth_user(ctx.author.id)
+        if auth_user is None:
+            return await ctx.message.reply(
+                "Your Discord account isn't linked to Alliance Auth."
+            )
+        targets = _corp_targets_from_directors(auth_user.id)
+        if not targets:
+            return await ctx.message.reply(
+                "You're not a director on any registered character."
+            )
+        embeds = _build_corp_report(targets, "your director corps")
         try:
             for e in embeds:
                 await ctx.author.send(embed=e)
@@ -418,8 +753,11 @@ class AuthCheck(commands.Cog):
                 )
             dm = True
 
-        await ctx.defer(ephemeral=dm)
-
+        # Resolve the invoker and scope BEFORE deferring: once a
+        # non-ephemeral defer is sent, Discord ignores ephemeral=True on
+        # the follow-ups, so these error replies would post publicly in
+        # super channels. The lookups are cheap single queries — the
+        # 3-second interaction deadline is not at risk.
         auth_user = _resolve_auth_user(ctx.user.id)
         if auth_user is None:
             return await ctx.respond(
@@ -448,6 +786,7 @@ class AuthCheck(commands.Cog):
                 )
             scope_label = "your director corps"
 
+        await ctx.defer(ephemeral=dm)
         embeds = _build_report(corps)
 
         if dm:
@@ -464,6 +803,128 @@ class AuthCheck(commands.Cog):
             if tier == "super":
                 await ctx.channel.send(
                     f"📬 {ctx.user.mention} requested authcheck for "
+                    f"**{scope_label}** — sent via DM"
+                )
+            await ctx.respond("📬 Sent you a DM.", ephemeral=True)
+        else:
+            # tier == 'super' here (regular forced dm=True above).
+            await ctx.respond(embed=embeds[0])
+            for e in embeds[1:]:
+                await ctx.followup.send(embed=e)
+
+    @commands.slash_command(
+        name="authcorpcheck", guild_ids=get_all_servers()
+    )
+    @option(
+        "corp",
+        description="Corp ticker or name (super channel only; "
+                    "defaults to all member-state corps)",
+        required=False,
+    )
+    @option(
+        "dm",
+        description="Send the report via DM instead of in this channel "
+                    "(super channel only; default false)",
+        required=False,
+        default=False,
+    )
+    async def slash_authcorpcheck(self, ctx, corp: str = None,
+                                  dm: bool = False):
+        try:
+            await self._authcorpcheck_impl(ctx, corp, dm)
+        except Exception as e:
+            # Same rationale as slash_authcheck: capture the traceback
+            # before aadiscordbot's generic handler swallows it.
+            logger.exception("authcorpcheck slash command failed")
+            msg = (
+                f"⚠️ AuthCorpCheck hit `{type(e).__name__}`. Ask an admin "
+                "to check the discordbot log for the traceback."
+            )
+            try:
+                if ctx.response.is_done():
+                    await ctx.followup.send(msg, ephemeral=True)
+                else:
+                    await ctx.respond(msg, ephemeral=True)
+            except Exception:
+                logger.exception("authcorpcheck error reply also failed")
+
+    async def _authcorpcheck_impl(self, ctx, corp, dm):
+        tier = _channel_tier(ctx.channel.id)
+        if tier is None:
+            return await ctx.respond(
+                "This command isn't available in this channel.",
+                ephemeral=True,
+            )
+
+        # Regular channels: lock to DM-only, director-scope. Reject the
+        # corp argument so callers don't get a silent override.
+        if tier == "regular":
+            if corp:
+                return await ctx.respond(
+                    "Requesting a specific corp is only allowed in a "
+                    "super channel. Try again without `corp:`.",
+                    ephemeral=True,
+                )
+            dm = True
+
+        # Same defer-last rationale as _slash_impl: keep the error
+        # replies genuinely ephemeral in super channels.
+        auth_user = _resolve_auth_user(ctx.user.id)
+        if auth_user is None:
+            return await ctx.respond(
+                "Your Discord account isn't linked to Alliance Auth.",
+                ephemeral=True,
+            )
+
+        if corp:
+            target = _resolve_corp(corp)
+            if target is None:
+                return await ctx.respond(
+                    f"Unknown corporation `{corp}`.", ephemeral=True,
+                )
+            targets = [_target_from_corp(target)]
+            scope_label = target.corporation_ticker
+        elif tier == "regular":
+            targets = _corp_targets_from_directors(auth_user.id)
+            if not targets:
+                return await ctx.respond(
+                    "You're not a director on any registered character.",
+                    ephemeral=True,
+                )
+            scope_label = "your director corps"
+        else:
+            # Super channel, no corp arg: every corp making up the
+            # configured member state(s).
+            state_names = getattr(
+                settings, "AUTHCHECK_MEMBER_STATES", ["Member"]
+            )
+            targets = _member_state_targets()
+            if not targets:
+                return await ctx.respond(
+                    "No member corporations found for state(s) "
+                    f"`{', '.join(state_names)}` — check "
+                    "`AUTHCHECK_MEMBER_STATES`.",
+                    ephemeral=True,
+                )
+            scope_label = f"{'/'.join(state_names)} state corps"
+
+        await ctx.defer(ephemeral=dm)
+        embeds = _build_corp_report(targets, scope_label)
+
+        if dm:
+            try:
+                for e in embeds:
+                    await ctx.user.send(embed=e)
+            except discord.Forbidden:
+                return await ctx.respond(
+                    "I can't DM you — check **Server Settings → "
+                    "Privacy → Allow direct messages from server "
+                    "members**.",
+                    ephemeral=True,
+                )
+            if tier == "super":
+                await ctx.channel.send(
+                    f"📬 {ctx.user.mention} requested authcorpcheck for "
                     f"**{scope_label}** — sent via DM"
                 )
             await ctx.respond("📬 Sent you a DM.", ephemeral=True)
