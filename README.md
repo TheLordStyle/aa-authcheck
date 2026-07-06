@@ -5,32 +5,43 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 An [Alliance Auth](https://gitlab.com/allianceauth/allianceauth) Discord
-cog that reports, per corporation, which members are **orphans**
-(present in the corp roster but never claimed in AA), which are
-**un-audited** (authed but never registered a corptools token), and
-which have **stale audit data** (last update older than a configurable
-threshold).
+cog with two commands:
+
+- **`/authcheck`** — per-**character** report: which corp members are
+  **orphans** (present in the corp roster but never claimed in AA),
+  **un-audited** (authed but never registered a corptools token), have
+  **stale audit data**, or are **OK**.
+- **`/authcorpcheck`** — per-**corporation** report: is the corp loaded
+  into corptools' **corporation audit** and is its data fresh, and is it
+  registered as a structure **Owner** in
+  [aa-structures](https://apps.allianceauth.org/apps/detail/aa-structures)
+  with healthy syncs and enabled tokens.
 
 Built on top of [aadiscordbot](https://github.com/pvyParts/allianceauth-discordbot)
 and [allianceauth-corptools](https://github.com/Solar-Helix-Independent-Transport/allianceauth-corp-tools).
 
 ## What it does
 
-Two tiers of Discord channel, configured separately:
+Two tiers of Discord channel, configured separately and shared by both
+commands:
 
-- **Regular channels** — anyone can run `/authcheck` and gets a **DM**
+- **Regular channels** — anyone can run the commands and gets a **DM**
   with the report for every corp where one of their auth-linked
   characters holds the EVE **Director** role.
 - **Super channels** — privileged users can additionally request the
   report for **any** corporation by ticker (no director check) and
   choose whether the response goes back in the channel (default) or
   via DM. When DM is chosen, a short audit line is posted in the super
-  channel so there's a record of the lookup.
+  channel so there's a record of the lookup. For `/authcorpcheck`, the
+  super-channel default scope (no `corp:` argument) is **every
+  corporation that makes up the Member state** — discovered
+  automatically from AA's state configuration (explicitly listed member
+  corps plus all corps of the member alliances).
 
-Outside both allow-lists the command silently refuses (slash: ephemeral
+Outside both allow-lists the commands silently refuse (slash: ephemeral
 *"not available in this channel"*; prefix: 👎 reaction).
 
-### Example output
+### Example output — `/authcheck`
 
 > __**NEWCO** (New Eden Corporation) — 124 members__
 >
@@ -50,6 +61,26 @@ Outside both allow-lists the command silently refuses (slash: ephemeral
 > • **Grace Onpoint** — authed as `grace`
 > • _(... 117 more ...)_
 
+### Example output — `/authcorpcheck`
+
+> **14 corps checked — 3 with issues**
+>
+> __**HOLDR** (Holding Corp Inc)__
+> 🟥 Corptools: corp not loaded into corp audit
+> 🟧 Structures: not registered as structure owner
+>
+> __**NEWCO** (New Eden Corporation)__
+> 🟨 Corptools: stale: wallet (never), assets (9.2h ago)
+> 🟩 Structures: active, syncs fresh, tokens 2/2 enabled
+>
+> __**OLDCO** (Old Eden Corporation)__
+> 🟩 Corptools: audit fresh
+> 🟨 Structures: stale sync: notifications (1.2h ago); tokens 1/2 enabled
+>
+> **🟩 All OK (11)**
+> AAA, BBBB, CCC, DDDD, EEE, FFFF, GGG, HHHH, III, JJJJ
+> KKKK
+
 ## Requirements
 
 | Component | Version |
@@ -57,6 +88,7 @@ Outside both allow-lists the command silently refuses (slash: ephemeral
 | Alliance Auth | ≥ 5.0 |
 | [allianceauth-discordbot](https://github.com/pvyParts/allianceauth-discordbot) | recent |
 | [allianceauth-corptools](https://github.com/Solar-Helix-Independent-Transport/allianceauth-corp-tools) | ≥ 2.x |
+| [aa-structures](https://apps.allianceauth.org/apps/detail/aa-structures) | optional — `/authcorpcheck`'s structure-owner checks are skipped when absent |
 | Database | MySQL / MariaDB |
 
 Corptools must have at least one character per director's account
@@ -72,7 +104,7 @@ the per-corp roster is derived from each character's public ESI data
 Add to your AA `requirements.txt`:
 
 ```text
-git+https://github.com/TheLordStyle/aa-authcheck.git@v0.1.3
+git+https://github.com/TheLordStyle/aa-authcheck.git@v0.2.0
 ```
 
 Then in `local.py`:
@@ -84,21 +116,25 @@ Then in `local.py`:
 # ============================================================
 DISCORD_BOT_COGS += ["aa_authcheck.authcheck"]
 
-# Channels where the command works in director-scope DM-only mode.
+# Channels where the commands work in director-scope DM-only mode.
 AUTHCHECK_DISCORD_BOT_CHANNELS = [
     111111111111111111,   # #directors
 ]
 
-# Channels where the command additionally unlocks `corp:` (any corp,
+# Channels where the commands additionally unlock `corp:` (any corp,
 # no director check) and `dm:` (channel reply by default, DM on
-# request). Use sparingly — these channels can pull a report on any
+# request), and where /authcorpcheck defaults to all member-state
+# corps. Use sparingly — these channels can pull a report on any
 # corporation in AA.
 AUTHCHECK_DISCORD_BOT_SUPER_CHANNELS = [
     222222222222222222,   # #leadership
 ]
 
-# Optional — default 7
-# AUTHCHECK_STALE_DAYS = 7
+# Optional — defaults shown
+# AUTHCHECK_STALE_DAYS = 7                     # /authcheck character staleness (days)
+# AUTHCHECK_MEMBER_STATES = ["Member"]         # states scanned by /authcorpcheck
+# AUTHCHECK_CORP_STALE_HOURS = 6               # corp-audit staleness (hours)
+# AUTHCHECK_CORP_AUDIT_FIELDS = ["wallet", "structures", "assets"]
 ```
 
 Rebuild and restart auth.
@@ -123,9 +159,19 @@ production state always returns to whatever's pinned in
 
 | Setting | Default | Description |
 |---|---|---|
-| `AUTHCHECK_DISCORD_BOT_CHANNELS` | `[]` | Regular allow-list. DM-only, director scope. Empty = command is blocked in non-super channels. |
-| `AUTHCHECK_DISCORD_BOT_SUPER_CHANNELS` | `[]` | Super allow-list. Unlocks the `corp:` and `dm:` slash-command arguments. If a channel appears in both lists, super wins. |
-| `AUTHCHECK_STALE_DAYS` | `7` | Day threshold beyond which a `last_update_*` timestamp counts as stale. |
+| `AUTHCHECK_DISCORD_BOT_CHANNELS` | `[]` | Regular allow-list. DM-only, director scope. Empty = commands are blocked in non-super channels. |
+| `AUTHCHECK_DISCORD_BOT_SUPER_CHANNELS` | `[]` | Super allow-list. Unlocks the `corp:` and `dm:` slash-command arguments (and member-state scope for `/authcorpcheck`). If a channel appears in both lists, super wins. |
+| `AUTHCHECK_STALE_DAYS` | `7` | `/authcheck`: day threshold beyond which a character's `last_update_*` timestamp counts as stale. |
+| `AUTHCHECK_MEMBER_STATES` | `["Member"]` | `/authcorpcheck`: AA State names whose corporations form the super-channel default scope. |
+| `AUTHCHECK_CORP_STALE_HOURS` | `6` | `/authcorpcheck`: hour threshold beyond which a corp-audit timestamp counts as stale (corptools updates corps hourly by default). |
+| `AUTHCHECK_CORP_AUDIT_FIELDS` | `["wallet", "structures", "assets"]` | `/authcorpcheck`: which corp-audit `last_update_<field>` timestamps to check. Valid names: `pub_data`, `assets`, `structures`, `moons`, `observers`, `wallet`, `contracts`, `known_login`. |
+
+Structure-owner sync freshness reuses the structures app's own grace
+settings when present: `STRUCTURES_STRUCTURE_SYNC_GRACE_MINUTES`
+(default 120, applies to structures + assets) and
+`STRUCTURES_NOTIFICATION_SYNC_GRACE_MINUTES` (default 40, applies to
+notifications + forwarding) — so a corp shows 🟨 here exactly when the
+structures app itself considers its sync unhealthy.
 
 ## Usage
 
@@ -161,6 +207,31 @@ in the super channel itself:
 
 so there's a public record of off-channel lookups.
 
+### `/authcorpcheck` — corporation audit health
+
+```text
+!authcorpcheck                          # director corps, DM-only (any allowed channel)
+/authcorpcheck                          # regular: director corps, DM'd
+                                        # super:   ALL member-state corps, posted in channel
+/authcorpcheck corp:NEWCO               # super only: one corp, posted in channel
+/authcorpcheck dm:true                  # super only: DM'd + audit line in channel
+```
+
+Per corp the report shows two status lines:
+
+- **Corptools** — 🟥 the corp isn't loaded into corptools' corporation
+  audit at all; 🟨 loaded but one of the checked `last_update_*`
+  timestamps is missing/older than `AUTHCHECK_CORP_STALE_HOURS`;
+  🟩 fresh.
+- **Structures** — 🟧 not registered as a structure owner in
+  aa-structures; 🟥 owner disabled (`is_active` off), no owner
+  characters, or all owner characters disabled (token failures);
+  🟨 sync timestamps outside the structures app's grace windows and/or
+  some tokens disabled; 🟩 active, syncs fresh, all tokens enabled.
+
+Corps with any non-🟩 line are listed first; all-clean corps are
+compacted into a ticker list at the end.
+
 ## How it works
 
 Per-corp report — one raw SQL query anchored on
@@ -179,6 +250,25 @@ Director detection — one raw SQL query joining
 `corptools_characteraudit` → `corptools_characterroles`, returning the
 distinct set of corporations where the invoker owns at least one
 character with `director = 1`.
+
+Corp-level report (`/authcorpcheck`) — two static IN-clause queries
+merged in Python, both keyed on the `EveCorporationInfo` **pk** (in
+`corptools_corporationaudit` and `structures_owner` the column named
+`corporation_id` is a FK to that pk, *not* the EVE corporation id):
+
+- `corptools_corporationaudit` — presence + the configured
+  `last_update_*` timestamps vs `AUTHCHECK_CORP_STALE_HOURS`.
+- `structures_owner` LEFT JOIN `structures_ownercharacter` (only when
+  the structures app is installed) — `is_active`, the four
+  `*_last_update_at` sync timestamps vs the structures app's grace
+  windows, and enabled-vs-total owner-character counts.
+
+Member-state discovery — the corporations of each state named in
+`AUTHCHECK_MEMBER_STATES`: the state's explicitly listed
+`member_corporations` plus every `EveCorporationInfo` whose alliance is
+in the state's `member_alliances`. AA itself creates and maintains a
+corp row for every corporation of a tracked alliance via the hourly
+`update_alliance` task, so the alliance-derived list is complete.
 
 ## Caveats
 
@@ -199,6 +289,23 @@ character with `director = 1`.
   roles scan, which uses ESI's `read_corporation_roles` cache. New
   directors won't be recognised until corptools' next scheduled scan
   for that character.
+- **Holding/shell corps show red forever.** The member-state scope
+  includes every corp of the member alliances — 1-character holding
+  corps that will never register a corptools corp audit show
+  🟥 "not loaded into corp audit" on every run. There is currently no
+  exclusion filter; a `member_count` threshold may be added later.
+- **Forwarding sync noise.** Structure owners configured without
+  notification webhooks can show a perpetually stale forwarding sync.
+  This mirrors the structures app's own `are_all_syncs_ok` health view
+  — if it's yellow here, it's unhealthy there too.
+- **Token validity isn't stored.** aa-structures checks token validity
+  live; the queryable signal is `is_enabled = False` on an owner
+  character (the app disables characters after repeated ESI failures).
+  A token that just went bad may briefly still show as enabled.
+- **Director corps unknown to AA.** A director corp with no
+  `EveCorporationInfo` row shows a red "not registered in Alliance
+  Auth" block — it can't have a corp audit or structure owner until
+  someone registers it in AA.
 
 ## Contributing
 
